@@ -1,0 +1,62 @@
+# =====================================================================
+# 每周自动同步上游 pbs05/ponwrt 到本仓库（独立仓库，无 fork 一键同步）
+# - 每周一 11:23（北京时间）自动执行，也可手动触发
+# - 只做 fast-forward/merge，绝不 force push；有冲突时直接报错退出，
+#   留给人工处理（不会破坏任何东西）
+# - 同步成功不会自动触发编译工作流（GITHUB_TOKEN 推送不触发 CI），
+#   同步后如需出新固件请手动 Run workflow
+# =====================================================================
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"   # UTC 周一 03:23 = 北京时间周一 11:23（错开整点高峰）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync from pbs05/ponwrt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream commits
+        run: |
+          git remote add upstream https://github.com/pbs05/ponwrt.git
+          git fetch upstream master --no-tags --filter=blob:none
+
+      - name: Count new upstream commits
+        id: check
+        run: |
+          n=$(git rev-list --count master..upstream/master)
+          echo "upstream new commits: $n"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream/master
+        if: steps.check.outputs.count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge upstream/master --no-edit -m "chore: sync upstream pbs05/ponwrt"
+
+      - name: Push to master
+        if: steps.check.outputs.count != '0'
+        run: |
+          git push origin master
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check.outputs.count }}" = "0" ]; then
+            echo "上游无新提交，本次跳过"
+          fi
