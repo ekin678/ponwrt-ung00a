@@ -1,24 +1,23 @@
-# 只编译 PonWrt 的 Unionman UNG00A（AN7581）一个型号
-# 放到 fork 仓库的 .github/workflows/build-ung00a.yml，然后在 Actions 页面点 Run workflow
+# PonWrt · 只编译 UNIONMAN UNG00A（AN7581）单个型号
 #
-# ── 历史记录与本次修正（基于 run #5 / #6 的真实日志）──────────────────────────
-#   run #5（133 分钟）编译本身是成功的，4 个文件全部产出：
-#     ...-unionman_ung00a-preloader.bin            110K
-#     ...-unionman_ung00a-bl31-uboot.fip           320K
-#     ...-unionman_ung00a-initramfs-recovery.itb    12M
-#     ...-unionman_ung00a-squashfs-sysupgrade.itb   14M
-#   但最后的 Show result 断言把文件名写成了 "bl31-u-boot.fip"（多了连字符），
-#   实际文件名是 "bl31-uboot.fip"（与 airoha_an7581-evb / nokia 各机型一致），
-#   于是 exit 1，后面的 "Upload firmware" 被跳过，artifact 没能上传。
-#   → v2 修法：断言改用通配匹配（不硬编码拼接），并且上传步骤用 if: always()，
-#     断言失败也照样把已产出的文件传上去。
+# ── 本次修正（v3）───────────────────────────────────────────────────────────
+# v2 的问题：三个补丁步骤都用「整行精确匹配」的 sed，一旦上游改了设备列表
+# 顺序或增删机型就直接 0 命中，靠后面的 grep 断言才发现，白跑一轮。
+# v3 改为「按语义定位 + 幂等」：
+#   * uboot/ATF 的 BUILD_DEVICES：只挑包含 airoha_an7581-evb 的行追加
+#     unionman_ung00a，不依赖行内其它机型，上游增删机型也不受影响。
+#   * an7581.mk 的 ARTIFACT：以 ARTIFACTS := 是否已存在为幂等判据，
+#     插入锚点优先 DEVICE_DTS、退而求其次 DEVICE_PACKAGES。
+#   * 三处补丁各自独立校验，任何一处没打上就直接 exit 1 并打印上下文，
+#     不会等到 2 小时后的镜像阶段才报错。
+# 另外：ccache 缓存编译器产物（首次 ~2h，之后可省 30%~50%），
+# concurrency 改为 cancel-in-progress: true（避免旧 run 白烧配额）。
 #
-#   另外两点沿用 run #5 已验证有效的经验：
-#   * 引导组件依赖：只选 ung00a 时，ATF 的 an7581-bl2 / an7581-bl31 包和
-#     uboot-airoha 的 an7581_rfb 变体都不会被编译，STAGING_DIR_IMAGE 里缺
-#     an7581-bl2.bin / an7581-bl31.lzma，镜像生成阶段 ARTIFACT 会失败。
-#     所以必须把 unionman_ung00a 追加进它们的 BUILD_DEVICES（见 Patch 步骤）。
-#   * an7581.mk 里 ung00a 块没有 ARTIFACT 定义，需要补 preloader.bin / bl31-uboot.fip。
+# ── 重要背景 ───────────────────────────────────────────────────────────────
+# 2026-10-22 的 run #8 在 1h1m 被取消，注解 "repository invocation blocked"，
+# 且日志为空；手动 dispatch 不再产生新 run。这是 GitHub 侧对该 fork 仓库的
+# 调用拦截，不是本文件的问题。详见仓库 issue / 对话记录。
+# 编译本体在 run #5 已完整跑通（133 分钟，4 个产物齐全）。
 
 name: Build PonWrt UNG00A
 
@@ -30,7 +29,7 @@ permissions:
 
 concurrency:
   group: build-ung00a
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -41,6 +40,8 @@ jobs:
     env:
       DEVICE: unionman_ung00a
       TARGET_DIR: bin/targets/airoha/an7581
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout
@@ -48,7 +49,8 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules
           sudo apt-get clean
           df -h /
 
@@ -81,130 +83,153 @@ jobs:
             echo "no secret found, generated a local signing key"
           fi
           openssl ec -in private-key.pem -pubout -out public-key.pem
-          head -1 private-key.pem
+
+      - name: Restore missing libffi package
+        run: |
+          # 上游仓库缺 package/libs/libffi（已知问题），python3 依赖它
+          if [ -f package/libs/libffi/Makefile ]; then
+            echo "libffi already present"
+            exit 0
+          fi
+          echo "::warning::package/libs/libffi missing, restoring from immortalwrt"
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/immortalwrt/immortalwrt.git /tmp/imm
+          git -C /tmp/imm sparse-checkout set package/libs/libffi
+          cp -r /tmp/imm/package/libs/libffi package/libs/libffi
+          test -f package/libs/libffi/Makefile
 
       - name: Update and install feeds
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Restore missing libffi package
+      # ── 引导组件补丁：只在需要的设备块里追加 ung00a，幂等、按语义匹配 ──
+      - name: Patch bootloader support for UNG00A
         run: |
-          if [ -f package/libs/libffi/Makefile ]; then
-            echo "libffi already present, nothing to do"
-            exit 0
-          fi
-          echo "::warning::package/libs/libffi is missing in this repository (upstream bug), restoring from immortalwrt"
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/immortalwrt/immortalwrt.git /tmp/imm
-          git -C /tmp/imm sparse-checkout set package/libs/libffi
-          cp -r /tmp/imm/package/libs/libffi package/libs/libffi
-          test -f package/libs/libffi/Makefile
-          echo "---- restored ----"
-          find package/libs/libffi -type f | head -20
-
-      - name: Patch UNG00A bootloader artifacts (preloader.bin / bl31-uboot.fip)
-        run: |
-          set -e
+          set -euo pipefail
           MK=target/linux/airoha/image/an7581.mk
+          UBOOT=package/boot/uboot-airoha/Makefile
+          ATF=package/boot/arm-trusted-firmware-airoha/Makefile
 
-          # 1) 给 unionman_ung00a 补 ARTIFACT。
-          #    用 awk 在设备块内 DEVICE_DTS 行前插入，不依赖 DEVICE_PACKAGES 的写法，
-          #    上游改动缩进/字段顺序也不会漏。插入后如果已存在则跳过（幂等）。
-          if grep -q "ARTIFACT/preloader.bin := an7581-preloader rfb" <(awk '/^define Device\/unionman_ung00a$/,/^endef$/' "$MK"); then
-            echo "ung00a already has ARTIFACT, skip patch"
+          # 1) 给 an7581_<任意 an7581 设备> 的 BUILD_DEVICES 行补 ung00a
+          #    只匹配含 airoha_an7581-evb 的行，an7583/en7523 的块不会被误伤
+          patch_build_devices() {
+            file="$1"
+            awk -v dev=unionman_ung00a '
+              /BUILD_DEVICES:=/ && /airoha_an7581-evb/ && index($0, dev) == 0 {
+                $0 = $0 " " dev
+              }
+              { print }
+            ' "$file" > "$file.new"
+            mv "$file.new" "$file"
+            echo "$file: $(grep -c 'BUILD_DEVICES:=.*unionman_ung00a' "$file" || true) line(s) now carry ung00a"
+          }
+
+          patch_build_devices "$UBOOT"
+          patch_build_devices "$ATF"
+
+          # ATF 需要 bl2 和 bl31 两个包都带上 ung00a
+          n=$(grep -c 'BUILD_DEVICES:=.*unionman_ung00a' "$ATF" || true)
+          echo "ATF patched blocks: $n"
+          [ "$n" -ge 2 ] || { echo "ERROR: ATF BUILD_DEVICES patch incomplete ($n<2)"; grep -n 'BUILD_DEVICES:=' "$ATF"; exit 1; }
+          grep -q 'BUILD_DEVICES:=.*unionman_ung00a' "$UBOOT" || {
+            echo "ERROR: uboot-airoha BUILD_DEVICES patch failed"; grep -n 'BUILD_DEVICES:=' "$UBOOT"; exit 1; }
+
+          # 2) ung00a 设备块补 ARTIFACT（preloader.bin / bl31-uboot.fip）
+          if awk '/^define Device\/unionman_ung00a$/,/^endef$/' "$MK" | grep -q 'ARTIFACTS :='; then
+            echo "ung00a already declares ARTIFACTS, skip"
           else
             awk '
-              $0 == "define Device/unionman_ung00a" { inblk=1 }
-              inblk && !done && /^  DEVICE_DTS :=/ {
+              /^define Device\/unionman_ung00a$/ { inblk = 1; print; next }
+              inblk && !done && ($0 ~ /^[[:space:]]*DEVICE_DTS/ || $0 ~ /^[[:space:]]*DEVICE_PACKAGES/) {
                 print "  ARTIFACT/preloader.bin := an7581-preloader rfb"
                 print "  ARTIFACT/bl31-uboot.fip := an7581-bl31-uboot rfb"
                 print "  ARTIFACTS := preloader.bin bl31-uboot.fip"
-                done=1
+                done = 1; print; next
+              }
+              inblk && /^endef$/ {
+                if (!done) {
+                  print "  ARTIFACT/preloader.bin := an7581-preloader rfb"
+                  print "  ARTIFACT/bl31-uboot.fip := an7581-bl31-uboot rfb"
+                  print "  ARTIFACTS := preloader.bin bl31-uboot.fip"
+                  done = 1
+                }
+                inblk = 0; print; next
               }
               { print }
-              inblk && $0 == "endef" { inblk=0 }
-            ' "$MK" > /tmp/an7581.mk.new
-            mv /tmp/an7581.mk.new "$MK"
-            echo "ung00a ARTIFACT inserted"
+              END { if (!done) exit 3 }
+            ' "$MK" > "$MK.new" || { echo "ERROR: 没找到 unionman_ung00a 设备块，上游结构变了"; exit 1; }
+            mv "$MK.new" "$MK"
+            echo "ARTIFACTS inserted"
           fi
 
           echo "==== unionman_ung00a device block ===="
           awk '/^define Device\/unionman_ung00a$/,/^endef$/' "$MK"
-          awk '/^define Device\/unionman_ung00a$/,/^endef$/' "$MK" | \
-            grep -q "ARTIFACT/bl31-uboot.fip" || {
-              echo "ERROR: an7581.mk patch failed (ung00a ARTIFACT missing)"; exit 1; }
-
-          # 2) ung00a 挂到 an7581_rfb U-Boot 的 BUILD_DEVICES（否则没有 an7581_rfb-u-boot.lzma）
-          sed -i 's|^  BUILD_DEVICES:=airoha_an7581-evb airoha_an7581-evb-emmc-eagle airoha_an7581-evb-emmc-kite$|  BUILD_DEVICES:=airoha_an7581-evb airoha_an7581-evb-emmc-eagle airoha_an7581-evb-emmc-kite unionman_ung00a|' \
-            package/boot/uboot-airoha/Makefile
-          grep -q "BUILD_DEVICES:=.*unionman_ung00a" package/boot/uboot-airoha/Makefile || {
-            echo "ERROR: uboot-airoha/Makefile patch failed (BUILD_DEVICES not updated)"; exit 1; }
-          grep -n "BUILD_DEVICES:=.*unionman_ung00a" package/boot/uboot-airoha/Makefile
-
-          # 3) ung00a 挂到 ATF an7581-bl2 / an7581-bl31 的 BUILD_DEVICES（否则缺 bl2.bin / bl31.lzma）
-          sed -i 's|^  BUILD_DEVICES:=airoha_an7581-evb airoha_an7581-evb-emmc-eagle airoha_an7581-evb-emmc-kite nokia_valyrian nokia_xg-040g-md-ubi$|  BUILD_DEVICES:=airoha_an7581-evb airoha_an7581-evb-emmc-eagle airoha_an7581-evb-emmc-kite nokia_valyrian nokia_xg-040g-md-ubi unionman_ung00a|' \
-            package/boot/arm-trusted-firmware-airoha/Makefile
-          # 注意：grep -c 在 0 命中时退出码为 1，配合 set -e 会静默中断，
-          # 所以必须 || true，保证下面能打印出真正的错误原因
-          n=$(grep -c "BUILD_DEVICES:=.*unionman_ung00a" package/boot/arm-trusted-firmware-airoha/Makefile || true)
-          echo "ATF BUILD_DEVICES patched blocks: $n"
-          [ "$n" -ge 2 ] || {
-            echo "ERROR: arm-trusted-firmware-airoha/Makefile patch failed (bl2/bl31 not both updated)"; exit 1; }
+          awk '/^define Device\/unionman_ung00a$/,/^endef$/' "$MK" | grep -q 'ARTIFACTS :=' || {
+            echo "ERROR: an7581.mk ARTIFACTS patch failed"; exit 1; }
 
       - name: Cache downloads
         uses: actions/cache@v6
         with:
           path: dl
-          key: ponwrt-dl-ung00a-${{ hashFiles('feeds.conf.default') }}
+          key: ponwrt-dl-ung00a-${{ hashFiles('feeds.conf.default', 'configs/an7581.config') }}
           restore-keys: |
             ponwrt-dl-ung00a-
 
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ponwrt-ccache-ung00a-${{ github.sha }}
+          restore-keys: |
+            ponwrt-ccache-ung00a-
+            ponwrt-ccache-
+
       - name: Configure UNG00A only
         run: |
+          set -euo pipefail
+          test -f configs/an7581.config || { echo "ERROR: configs/an7581.config 不存在"; ls configs | head; exit 1; }
           cp configs/an7581.config .config
 
-          # 先把上游默认开着的所有 an7581 设备全部关掉（动态，不维护名单），
-          # 再单独打开 ung00a —— 上游以后新增设备也不会漏关。
+          # 关掉上游默认开启的全部 an7581 设备，再单独开 ung00a
           sed -i -E 's|^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_(.+)=y|# CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_\1 is not set|' .config
           sed -i 's|^# CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a is not set|CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y|' .config
-          grep -q "^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y" .config || \
-            echo "CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y" >> .config
+          grep -q '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y' .config || \
+            echo 'CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y' >> .config
+
+          # 打开 ccache
+          grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
 
           make defconfig
 
           echo "==== selected devices ===="
-          grep -E "^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y" .config || true
-          count=$(grep -cE "^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y" .config || true)
+          grep -E '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y' .config
+          count=$(grep -cE '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y' .config || true)
           echo "device count: $count"
-          [ "$count" -eq 1 ] || { echo "ERROR: expected exactly 1 device, got $count"; exit 1; }
-          grep -qE "^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y" .config || {
-            echo "ERROR: unionman_ung00a is not selected"; exit 1; }
+          [ "$count" -eq 1 ] || { echo "ERROR: 期望 1 个设备，实际 $count"; exit 1; }
+          grep -q '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_unionman_ung00a=y' .config || {
+            echo "ERROR: unionman_ung00a 未被选中"; exit 1; }
 
-          # libffi 兜底：只有 python3 被选中时才需要
-          if grep -q "^CONFIG_PACKAGE_python3=y" .config; then
-            if ! grep -q "^CONFIG_PACKAGE_libffi=y" .config; then
-              echo "python3 enabled but libffi missing -> forcing libffi on"
+          if grep -q '^CONFIG_PACKAGE_python3=y' .config; then
+            grep -q '^CONFIG_PACKAGE_libffi=y' .config || {
+              echo "python3 已选但 libffi 缺失 -> 强制打开"
               sed -i 's|^# CONFIG_PACKAGE_libffi is not set|CONFIG_PACKAGE_libffi=y|' .config
               make defconfig
-            fi
-            grep -q "^CONFIG_PACKAGE_libffi=y" .config || {
-              echo "ERROR: python3 enabled but libffi still not selected"; exit 1; }
-            echo "libffi: OK"
-          else
-            echo "python3 not selected -> libffi not required"
+            }
+            grep -q '^CONFIG_PACKAGE_libffi=y' .config || {
+              echo "ERROR: python3 已选但 libffi 仍未生效"; exit 1; }
           fi
 
           {
             echo "### configure"
             echo '```'
-            grep -E "^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y" .config || true
-            grep -E "^CONFIG_PACKAGE_(python3|libffi)=" .config || echo "(python3/libffi not selected)"
+            grep -E '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y' .config
+            grep -E '^CONFIG_(CCACHE|PACKAGE_python3|PACKAGE_libffi)=' .config || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download sources
-        run: make download -j8
+        run: make download -j"$(nproc)"
 
       - name: Build firmware
         run: |
@@ -215,28 +240,23 @@ jobs:
         if: failure()
         continue-on-error: true
         run: |
-          # silent 并行构建会把镜像生成的真实报错吞掉，失败时用 V=s -j1 重跑
-          # target/linux/install 抓详细错误（只重跑镜像生成，不重编内核）
+          # 并行构建会吞掉镜像阶段的真实报错，失败后用 V=s -j1 只重跑镜像生成
           timeout 2400 make -j1 V=s target/linux/install > /tmp/verbose-fail.log 2>&1 || true
           tail -n 120 /tmp/verbose-fail.log
 
       - name: Dump failure info
         if: failure()
         run: |
-          # 日志先落到工作区内，upload-artifact 对工作区外绝对路径（/tmp）行为不稳定，
-          # 用工作区相对路径最稳
           mkdir -p build-logs
           cp -f /tmp/build-full.log build-logs/build-full.log 2>/dev/null || true
           cp -f /tmp/verbose-fail.log build-logs/verbose-fail.log 2>/dev/null || true
-          ls -lh build-logs || true
-
           if [ -f /tmp/build-full.log ]; then
             {
-              echo "## First error lines"
+              echo "## 首批错误行"
               echo '```'
-              grep -n -m 12 -i -E "error:|Error [0-9]|No space left|Killed|out of memory|recipe for target|failed to build" /tmp/build-full.log || echo "(no match)"
+              grep -n -m 12 -i -E 'error:|Error [0-9]|No space left|Killed|out of memory|recipe for target|failed to build' /tmp/build-full.log || echo '(no match)'
               echo '```'
-              echo "## Last 200 lines"
+              echo "## 末尾 200 行"
               echo '```'
               tail -n 200 /tmp/build-full.log
               echo '```'
@@ -252,7 +272,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # ── 产物清点：只做记录 + 打警告，不 exit 1，避免再次因命名问题挡住上传 ──
       - name: Show result
         if: always()
         run: |
@@ -260,7 +279,6 @@ jobs:
           ls -lh "$TARGET_DIR" || true
           du -sh "$TARGET_DIR" 2>/dev/null || true
 
-          echo "==== expected artifacts ===="
           {
             echo "### 期望产物"
             echo "| 文件 | 大小 | 状态 |"
@@ -272,15 +290,14 @@ jobs:
             pat="$1"; label="$2"
             f=$(ls -1 $TARGET_DIR/$pat 2>/dev/null | head -1)
             if [ -n "$f" ] && [ -s "$f" ]; then
-              printf '| %s | %s | ✅ |\n' "$label" "$(du -h "$f" | cut -f1)" >> /tmp/summary.md
+              printf '| %s | %s | OK |\n' "$label" "$(du -h "$f" | cut -f1)" >> /tmp/summary.md
               echo "OK   $label -> $f"
             else
-              printf '| %s | - | ❌ 缺失 |\n' "$label" >> /tmp/summary.md
+              printf '| %s | - | MISSING |\n' "$label" >> /tmp/summary.md
               echo "MISS $label (pattern: $TARGET_DIR/$pat)"
               missing=$((missing+1))
             fi
           }
-
           check "*-unionman_ung00a-squashfs-sysupgrade.itb" "sysupgrade.itb"
           check "*-unionman_ung00a-initramfs-recovery.itb"  "recovery.itb"
           check "*-unionman_ung00a-preloader.bin"           "preloader.bin"
@@ -288,11 +305,9 @@ jobs:
 
           cat /tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "missing count: $missing"
-          if [ "$missing" -gt 0 ]; then
-            echo "::warning::$missing expected artifact(s) missing, see listing above"
-          fi
+          [ "$missing" -eq 0 ] || echo "::warning::$missing 个预期产物缺失"
+          # 注意：这里不 exit 1，避免命名差异再次挡住上传
 
-      # ── 上传：永远执行，即使上面的断言/构建有问题也把已有文件传上去 ──
       - name: Upload firmware
         if: always()
         uses: actions/upload-artifact@v7
@@ -316,7 +331,6 @@ jobs:
             echo "---"
             echo "下载：run 页面底部 **Artifacts** → \`ponwrt-an7581-unionman_ung00a\`"
             echo ""
-            echo "刷机文件：\`*-squashfs-sysupgrade.itb\`（系统升级）；"
-            echo "\`*-initramfs-recovery.itb\`（救砖/恢复）；"
-            echo "\`*-preloader.bin\` + \`*-bl31-uboot.fip\`（引导，刷错会变砖，非必要别动）"
+            echo "刷机：\`*-squashfs-sysupgrade.itb\` 系统升级；\`*-initramfs-recovery.itb\` 救砖；"
+            echo "\`*-preloader.bin\` + \`*-bl31-uboot.fip\` 引导（刷错变砖，非必要不动）"
           } >> "$GITHUB_STEP_SUMMARY"
